@@ -93,7 +93,10 @@ class Input_Fixpoint_Specs(QWidget):
             # update fields in the filter topology widget - wordlength may have
             # been changed
             self.update_wdg_UI()
-
+        if 'fx_sim' in dict_sig and dict_sig['fx_sim'] == 'init':
+                self.fx_sim_init()
+        if 'fx_sim' in dict_sig and dict_sig['fx_sim'] == 'start':
+                self.fx_sim_start()
         if 'fx_sim' in dict_sig and dict_sig['fx_sim'] == 'set_stimulus':
                 self.fx_sim_set_stimulus(dict_sig)
             # PingPong with a stimulus & plot widget:
@@ -405,21 +408,24 @@ class Input_Fixpoint_Specs(QWidget):
         # get a dict with the coefficients and fixpoint settings from fixpoint widget
         self.hdl_dict = self.fx_wdg_inst.get_hdl_dict()
         self.q_i = fx.Fixed(self.hdl_dict['QI']) # setup quantizer for input quantization
+        self.q_i.setQobj({'frmt':'dec'})#, 'scale':'int'}) # use integer decimal format
+        self.q_o = fx.Fixed(self.hdl_dict['QO']) # setup quantizer for output quantization
+
 
         b = [ int(x) for x in self.hdl_dict['QC']['b']] # convert np.int64 to python int
         a = [ int(x) for x in self.hdl_dict['QC']['a']] # convert np.int64 to python int
 
-        # self.fx_wdg_inst.setup_HDL(self.hdl_dict) # call setup method of filter widget
+        # call setup method of filter widget - this is not implemented (yet)
+        # self.fx_wdg_inst.setup_HDL(self.hdl_dict)
         
         self.hdlfilter = FilterFIR()     # Standard DF1 filter - hdl_dict should be passed here
 
-        input_wi = self.hdl_dict['QI']['WI'] 
-        input_wf = self.hdl_dict['QI']['WF']
-        coeff_wi = self.hdl_dict['QC']['WI']
-        coeff_wf = self.hdl_dict['QC']['WF']
-
-        self.hdlfilter.set_word_format((coeff_wi + coeff_wf + 1, coeff_wi, coeff_wf), 
-                                          (input_wi + input_wf + 1, input_wi, input_wf ))
+        # pass wordlength for input, coefficients, output
+        self.hdlfilter.set_word_format(
+                (self.hdl_dict['QI']['W'], self.hdl_dict['QI']['WI'], self.hdl_dict['QI']['WF']),
+                (self.hdl_dict['QC']['W'], self.hdl_dict['QC']['WI'], self.hdl_dict['QC']['WF']),
+                (self.hdl_dict['QO']['W'], self.hdl_dict['QO']['WI'], self.hdl_dict['QO']['WF'])
+                )
 
         self.hdlfilter.set_coefficients(coeff_b = b)  # Coefficients for the filter
 
@@ -437,38 +443,54 @@ class Input_Fixpoint_Specs(QWidget):
                 filter=file_types)
         hdl_file = qstr(hdl_file)
 
-        if hdl_file != "": # "operation cancelled" gives back an empty string
+        if hdl_file != "": # "operation cancelled" returns an empty string
+            # return '.v' or '.vhd' depending on filetype selection:
+            hdl_type = extract_file_ext(qstr(hdl_filter))[0]
+            # sanitized dir + filename + suffix. The filename suffix is replaced
+            # by `hdl_tyoe` later.
             hdl_file = os.path.normpath(hdl_file)
-            hdl_type = extract_file_ext(qstr(hdl_filter))[0] # return '.v' or '.vhd'
-
             hdl_dir_name = os.path.dirname(hdl_file) # extract the directory path
             if not os.path.isdir(hdl_dir_name): # create directory if it doesn't exist
                 os.mkdir(hdl_dir_name)
             dirs.save_dir = hdl_dir_name # make this directory the new default / base dir
 
-            # return the filename without suffix
+            # remove the suffix from the filename:
             hdl_file_name = os.path.splitext(os.path.basename(hdl_file))[0]
 
-            self.setupHDL()
-
-
-            if str(hdl_type) == '.vhd':
+            if hdl_type == '.vhd':
                 hdl = 'VHDL'
-                suffix = '.vhd'
-            else:
+            elif hdl_type == '.v':
                 hdl = 'Verilog'
-                suffix = '.v'
+            else:
+                logger.error('Unknown file extension "{0}", cancelling.'.format(hdl_type))
+                return
 
             logger.info('Creating hdl_file "{0}"'.format(
-                        os.path.join(hdl_dir_name, hdl_file_name + suffix)))
-
+                        os.path.join(hdl_dir_name, hdl_file_name + hdl_type)))
             try:
-                
+                self.setupHDL()
                 self.hdlfilter.convert(hdl=hdl, name=hdl_file_name, path=hdl_dir_name)
 
                 logger.info("HDL conversion finished!")
             except (IOError, TypeError) as e:
                 logger.warning(e)
+
+
+#------------------------------------------------------------------------------
+    def fx_sim_init(self):
+        """
+        Initialize fix-point simulation: Request the quantization dict including
+            the filter name
+        """
+        try:
+            logger.info("Initialize fixpoint simulation")
+            self.setupHDL()
+            dict_sig = {'sender':__name__, 'fx_sim':'set_hdl_dict', 'hdl_dict':self.hdl_dict}
+            self.sig_tx.emit(dict_sig)
+                        
+        except myhdl.SimulationError as e:
+            logger.warning("Fixpoint initialization failed:\n{0}".format(e))
+        return
 
 #------------------------------------------------------------------------------
     def fx_sim_start(self):
@@ -489,20 +511,20 @@ class Input_Fixpoint_Specs(QWidget):
 #------------------------------------------------------------------------------
     def fx_sim_set_stimulus(self, dict_sig):
         """
-        - Pass fix-point stimulus from dict_sig to HDL filter, 
+        - Get fix-point stimulus from dict_sig
+        - Scale fixpoint response with 2**W (input) and pass it to HDL filter
         - Calculate the fixpoint response
         - Send it to the plotting widget
         """
         try:
-            W = self.hdl_dict['QC']['WI'] + self.hdl_dict['QC']['WF']
-            # TODO: Scale is still wrong
-            self.stim = self.q_i.float2frmt(dict_sig['fx_stimulus'])
-
+            self.stim = self.q_i.fixp(dict_sig['fx_stimulus']) * (1 << self.q_i.W-1)
+            logger.info("stim {0}{1}\n{2}".format(type(self.q_i.W), self.q_i.q_obj, self.stim))
             self.hdlfilter.set_stimulus(self.stim)    # Set the simulation input
             logger.info("Start fixpoint simulation with stimulus from {0}.".format(dict_sig['sender']))
+
             self.hdlfilter.run_sim()         # Run the simulation
             # Get the response from the simulation and scale it to float
-            self.fx_results = self.hdlfilter.get_response() / (2<<(W-1)) 
+            self.fx_results = self.hdlfilter.get_response() / (1 << self.q_o.W-1) 
             #TODO: fixed point / integer to float conversion?
             #TODO: color push-button to show state of simulation
             #TODO: add QTimer single shot
@@ -513,6 +535,9 @@ class Input_Fixpoint_Specs(QWidget):
 
         except myhdl.SimulationError as e:
             logger.warning("Simulation failed:\n{0}".format(e))
+            return
+        except ValueError as e:
+            logger.warning("Overflow error {0}".format(e))
             return
 
         logger.info("Fixpoint plotting started")
