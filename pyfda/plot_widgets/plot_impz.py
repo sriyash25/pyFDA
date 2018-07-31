@@ -30,6 +30,9 @@ from .plot_impz_ui import PlotImpz_UI
 # TODO: "Home" calls redraw for all three mpl widgets
 # TODO: changing the view on some widgets redraws h[n] unncessarily
 # TODO: keywords 'ms', 'alpha', 'lw' not defined for stems?
+# TODO: fixpoint scaling is applied in spite of cmbbox = float
+# TODO: fir fixpoint  scaling is off by 1 bit due to W_c + W_I without -1
+# TODO: Increasing number of data points repeats the previous ones in fixpoint mode
 
 class Plot_Impz(QWidget):
     """
@@ -66,7 +69,7 @@ class Plot_Impz(QWidget):
         #--------------------------------------------
         # initialize routines and settings
         self._log_mode_time()
-        self.fx_sim_ctrl()        
+        self.fx_select()        
         self.draw() # initial calculation and drawing
 
 
@@ -117,9 +120,9 @@ class Plot_Impz(QWidget):
         # SIGNALS & SLOTs
         #----------------------------------------------------------------------
         # --- run control ---
-        self.ui.cmb_sim_select.currentIndexChanged.connect(self.fx_sim_ctrl)
-        self.ui.but_run.clicked.connect(self.fx_sim_init)
-        self.ui.chk_fx_scale.clicked.connect(self.redraw)
+        self.ui.cmb_sim_select.currentIndexChanged.connect(self.fx_select)
+        self.ui.but_run.clicked.connect(self.fx_run)
+        self.ui.chk_fx_scale.clicked.connect(self.draw_impz_time)
         # --- time domain plotting ---
         self.ui.cmb_plt_time_resp.currentIndexChanged.connect(self.draw_impz_time)
         self.ui.chk_marker_resp.clicked.connect(self.draw_impz_time)
@@ -127,6 +130,7 @@ class Plot_Impz(QWidget):
         self.ui.chk_marker_stim.clicked.connect(self.draw_impz_time)
         self.ui.chk_log.clicked.connect(self._log_mode_time)
         self.ui.led_log_bottom.editingFinished.connect(self._log_mode_time)
+        self.ui.chk_fx_range.clicked.connect(self.draw_impz_time)
         # --- frequency domain plotting ---
         self.ui.cmb_plt_freq.currentIndexChanged.connect(self.draw_impz_freq)
         # --- stimulus plotting ---
@@ -159,9 +163,11 @@ class Plot_Impz(QWidget):
         if 'fx_sim' in dict_sig:
             try:
                 if dict_sig['fx_sim'] == 'set_hdl_dict':
-                    self.fx_set_hdl_dict() # pass hdl dict
+                    self.fx_set_hdl_dict(dict_sig) # pass hdl dict
 
                 if dict_sig['fx_sim'] == 'get_stimulus':
+                    # read hdl_dict and calculate stimulus
+                    self.hdl_dict = dict_sig['hdl_dict']
                     self.calc_stimulus() # calculate selected stimulus with selected length
                     # pass stimulus in self.x back  via dict
                     self.sig_tx.emit({'sender':__name__, 'fx_sim':'set_stimulus',
@@ -174,7 +180,7 @@ class Plot_Impz(QWidget):
                     self.draw_impz()
                     
             except KeyError as e:
-                logger.error('Interface to fixpoint simulation is defect:\n{0}.'.format(e))
+                logger.error('Key {0} missing in "hdl_dict".'.format(e))
                 self.fx_sim = None
 
         if self.isVisible():
@@ -284,22 +290,29 @@ class Plot_Impz(QWidget):
                 str(params['FMT'].format(self.f2 * fb.fil[0]['f_S'])))
 
 # =============================================================================
-    def fx_sim_ctrl(self):
+    def fx_select(self):
         """
         Select between fixpoint and floating point simulation
         """
         self.sim_select = qget_cmb_box(self.ui.cmb_sim_select, data=False)
-        self.sim_fxp = (self.sim_select == 'Fixpoint')
-        self.ui.but_run.setVisible(self.sim_fxp)
-        self.ui.chk_fx_scale.setVisible(self.sim_fxp)
-        
-    def fx_sim_init(self):
+        self.fx_sim = (self.sim_select == 'Fixpoint')
+        self.ui.but_run.setVisible(self.fx_sim)
+        self.ui.chk_fx_scale.setVisible(self.fx_sim)
+        self.ui.chk_fx_range.setVisible(self.fx_sim)
+        self.hdl_dict = None
+
+        if self.fx_sim:
+            self.fx_run()
+        else:
+            self.draw()
+
+    def fx_run(self):
         """
         Run fixpoint simulation
         """        
-        self.sig_tx.emit({'sender':__name__, 'fx_sim':'init'})
-#        self.draw()
-    def fx_set_hdl_dict(self):
+        self.sig_tx.emit({'sender':__name__, 'fx_sim':'start'})
+
+    def fx_set_hdl_dict(self, dict_sig):
         """
         Set quantization dict
         """
@@ -307,13 +320,6 @@ class Plot_Impz(QWidget):
             self.hdl_dict = dict_sig['hdl_dict']
         except (KeyError, ValueError) as e:
             logger.warning(e)
-                
-    def fx_sim_set_hdl_dict(self):
-        """
-        Set quantization dictionary
-        """        
-        self.sig_tx.emit({'sender':__name__, 'fx_sim':'init'})
-
 
 #------------------------------------------------------------------------------
     def calc_stimulus(self):
@@ -381,7 +387,7 @@ class Plot_Impz(QWidget):
         """
         (Re-)calculate filter response y[n]
         """
-        if qget_cmb_box(self.ui.cmb_sim_select) == 'Fix':
+        if qget_cmb_box(self.ui.cmb_sim_select, data=False) == 'Fixpoint':
             pass
         else:
             # calculate response self.y_r[n] and self.y_i[n] (for complex case) =====   
@@ -390,6 +396,8 @@ class Plot_Impz(QWidget):
             if min(len(self.aa), len(self.bb)) < 2:
                 logger.error('No proper filter coefficients: len(a), len(b) < 2 !')
                 return
+
+            logger.info("Coefficient area = {0}".format(np.sum(np.abs(self.bb))))
     
             sos = np.asarray(fb.fil[0]['sos'])
             antiCausal = 'zpkA' in fb.fil[0]
@@ -547,20 +555,53 @@ class Plot_Impz(QWidget):
         mkfmt_i = 'd'
 
         self._init_axes_time()
-        
+        scale_i = scale_o = 1
+        fx_min = -1.
+        fx_max = 1.
+        if qget_cmb_box(self.ui.cmb_sim_select, data=False) == 'Fixpoint':
+            try:
+                logger.warning("hdl_dict {0}".format(self.hdl_dict))
+                WI = self.hdl_dict['QI']['W']
+                WO = self.hdl_dict['QO']['W']
+            except AttributeError as e:
+                logger.error("Attribute error: {0}".format(e))
+                WI = WO = 1
+            except TypeError as e:
+                logger.error("Type error: 'hdl_dict'={0},\n{1}".format(self.hdl_dict, e))
+                WI = WO = 1
+            except ValueError as e:
+                logger.error("Value error: {0}".format(e))
+                WI = WO = 1
+
+            if self.ui.chk_fx_scale.isChecked():
+                scale_i = 1 << WI-1
+                fx_min = - (1 << WO-1)
+                fx_max = (1 << WO-1) - 1
+            else:
+                scale_o = 1. / (1 << WO-1)
+                fx_min = -1
+                fx_max = 1 - scale_o
+                
+                
+        logger.info("scale WI:{0} WO:{1}".format(scale_i, scale_o))
+
         if self.ui.chk_log.isChecked(): # log. scale for stimulus / response time domain
             H_str = '$|$' + self.H_str + '$|$ in dBV'
-            x = np.maximum(20 * np.log10(abs(self.x)), self.bottom)
-            y = np.maximum(20 * np.log10(abs(self.y_r)), self.bottom)
+            x = np.maximum(20 * np.log10(abs(self.x * scale_i)), self.bottom)
+            y = np.maximum(20 * np.log10(abs(self.y_r * scale_o)), self.bottom)
             if self.cmplx:
                 y_i = np.maximum(20 * np.log10(abs(self.y_i)), self.bottom)
                 H_i_str = r'$|\Im\{$' + self.H_str + '$\}|$' + ' in dBV'
                 H_str =   r'$|\Re\{$' + self.H_str + '$\}|$' + ' in dBV'
+            fx_min = 20*np.log10(abs(fx_min))
+            fx_max = fx_min
+             
         else:
             self.bottom = 0
-            x = self.x
-            y = self.y_r
-            y_i = self.y_i
+            x = self.x * scale_i
+            y = self.y_r * scale_o
+            if self.cmplx:
+                y_i = self.y_i * scale_o
             
             if self.cmplx:           
                 H_i_str = r'$\Im\{$' + self.H_str + '$\}$ in V'
@@ -568,6 +609,10 @@ class Plot_Impz(QWidget):
             else:
                 H_str = self.H_str + ' in V'
 
+        if self.ui.chk_fx_range.isChecked() and self.fx_sim:
+            self.ax_r.axhline(fx_max,0, 1, color='k', linestyle='--')
+            self.ax_r.axhline(fx_min,0, 1, color='k', linestyle='--')
+            
         plot_stim_dict = self.fmt_plot_stim.copy()
 
         if self.plt_time_stim == "line":
